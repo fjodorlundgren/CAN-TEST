@@ -15,8 +15,8 @@ const uint32_t kDjiBaudRate = 1000000;
 
 // DJI gimbal control ranges and defaults (in 0.1 degree steps)
 const int16_t kDefaultTargetYaw = 1800;    // Range: -1800 to 1800 (-180° to 180°)
-const int16_t kDefaultTargetRoll = 300;   // Range: -300 to 300 (-30° to 30°)
-const int16_t kDefaultTargetPitch = 900;   // Range: -560 to 1460 (-56° to 146°)
+const int16_t kDefaultTargetRoll = 200;   // Range: -300 to 300 (-30° to 30°)
+const int16_t kDefaultTargetPitch = 500;   // Range: -560 to 1460 (-56° to 146°)
 
 // DJI command packet constants
 const uint8_t kDjiPacketStartMarker = 0xAA;
@@ -27,6 +27,7 @@ const uint8_t kDefaultActionTime = 20;
 
 // Timing constants
 const unsigned long kSendIntervalMs = 5000;  // Send command every 5 seconds
+const unsigned long kAngleRequestIntervalMs = 500;  // Request angles every 500ms (2 Hz)
 const unsigned long kFrameDelayUs = 500;    // Delay between CAN frames
 const unsigned long kLoopDelayMs = 10;      // Main loop delay
 
@@ -52,6 +53,7 @@ extern uint8_t action_time;
 
 // Timing variables
 extern unsigned long last_send_time;
+extern unsigned long last_angle_request_time;
 
 // =============================================================================
 // Function Declarations
@@ -127,5 +129,33 @@ void SendDjiPositionCommand();
  * and message handling for DJI device communication.
  */
 void SetupCanCommunication();
+
+/**
+ * @brief Requests current gimbal angle information from DJI device
+ * @param request_type Type of angles to request (0x01 = attitude, 0x02 = joint)
+ * 
+ * Sends a DJI angle information request command. The response will be
+ * handled by the CAN message callback function.
+ */
+void RequestGimbalAngles(uint8_t request_type);
+
+/**
+ * @brief Handles incoming DJI angle response messages
+ * @param msg Reference to the received CAN message
+ * 
+ * Processes angle information responses from the DJI device and
+ * extracts yaw, roll, and pitch values for monitoring.
+ */
+void HandleAngleResponse(const CAN_message_t& msg);
+
+/**
+ * @brief Processes a complete DJI response packet from multiple CAN frames
+ * @param packet_data Pointer to the complete packet data
+ * @param packet_length Length of the complete packet
+ * 
+ * Parses the reconstructed DJI response packet and handles different
+ * command responses (angles, status, etc.).
+ */
+void ProcessDjiResponse(const uint8_t* packet_data, uint8_t packet_length);
 
 #endif  // MAIN_H_
