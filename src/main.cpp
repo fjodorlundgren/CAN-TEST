@@ -1,38 +1,30 @@
 #include <Arduino.h>
 #include <FlexCAN_T4.h>
+#include "gimbal_position_set.h"
+#include "gimbal_position_readout.h"
+// #include "gimbal_test_command.h"
 
-FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can0;
+FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can1;
 
 #define DJI_CAN_TX_ID 0x223
 #define DJI_CAN_RX_ID 0x222
-#define DJI_BAUD_RATE 1000000
+#define DJI_BAUD_RATE 500000
 
-int16_t target_yaw = -900;   // range: -1800 to 1800 (in 0.1 degree steps), for craft only -900 to 900
-int16_t target_roll = 0;     // range: -300 to 300 (in 0.1 degree steps)
-int16_t target_pitch = -560; // range: -560 to 1460 (in 0.1 degree steps)
-uint8_t control_mode = 0x01;
-uint8_t action_time = 20;
-
+// Timing variables
 unsigned long lastSend = 0;
 const unsigned long SEND_INTERVAL = 5000;
 
-// Variables for angle information requests
-unsigned long lastAngleRequest = 0;
-const unsigned long ANGLE_REQUEST_INTERVAL = 100; // Request angles every 1 second
+// CAN monitoring variables
+static unsigned long total_rx_messages = 0;
+static unsigned long last_rx_count_check = 0;
+const unsigned long RX_CHECK_INTERVAL = 10000; // Check every 10 seconds
 
-// Variables to store received angle information
-struct GimbalAngles
-{
-    int16_t yaw = 0;       // in 0.1 degree units
-    int16_t roll = 0;      // in 0.1 degree units
-    int16_t pitch = 0;     // in 0.1 degree units
-    uint8_t data_type = 0; // 0=not ready, 1=attitude angle, 2=joint angle
-    bool data_valid = false;
-    unsigned long last_update = 0;
-};
+// Configuration option (change this to try different setups)
+#define CAN_CONFIG_OPTION 1 // 1=Mailboxes, 2=FIFO, 3=Mixed
 
-GimbalAngles current_angles;
-bool enable_angle_requests = true; // Set to false to disable angle requests
+// =============================================================================
+// CRC CALCULATION FUNCTIONS
+// =============================================================================
 
 uint8_t reflect8(uint8_t data)
 {
@@ -125,109 +117,13 @@ uint32_t calculateCRC32_DJI(uint8_t *data, uint16_t length)
     return reflect32(crc);
 }
 
-void setup()
-{
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("DJI Gimbal CAN Monitor - Enhanced Debug Version");
-    Serial.println("Monitoring CAN ID 0x222 (RX) and 0x223 (TX)");
-
-    can0.begin();
-    can0.setBaudRate(DJI_BAUD_RATE);
-    can0.setMaxMB(16);
-    can0.enableFIFO();
-    can0.enableFIFOInterrupt();
-
-    // Listen to DJI gimbal responses
-    can0.setFIFOFilter(REJECT_ALL);
-    can0.setFIFOFilter(0, DJI_CAN_RX_ID, STD); // Only listen to 0x222
-
-    can0.onReceive([](const CAN_message_t &msg)
-                   {
-                       // Print ALL received CAN messages with timestamp
-                       Serial.print("[");
-                       Serial.print(millis());
-                       Serial.print("ms] CAN RX ID:0x");
-                       if (msg.id < 0x100) Serial.print("0");
-                       if (msg.id < 0x10) Serial.print("0");
-                       Serial.print(msg.id, 16);
-                       Serial.print(" Len:");
-                       Serial.print(msg.len);
-                       Serial.print(" Data:");
-                       for (int i = 0; i < msg.len; i++) {
-                           Serial.print(" ");
-                           if (msg.buf[i] < 0x10) Serial.print("0");
-                           Serial.print(msg.buf[i], 16);
-                       }
-                       Serial.println();
-                       
-                       // Packet reconstruction logic
-                       static uint8_t receive_buffer[64];
-                       static uint8_t buffer_index = 0;
-                       
-                       // Add received bytes to buffer
-                       for (int i = 0; i < msg.len; i++) {
-                           if (buffer_index < 64) {
-                               receive_buffer[buffer_index++] = msg.buf[i];
-                           }
-                       }
-                       
-                       // Check if we have a packet starting with 0xAA
-                       if (buffer_index >= 3 && receive_buffer[0] == 0xAA) {
-                           uint16_t packet_length = receive_buffer[1] | (receive_buffer[2] << 8);
-                           
-                           Serial.print("  [PACKET] Expected len:");
-                           Serial.print(packet_length);
-                           Serial.print(", Buffer has:");
-                           Serial.println(buffer_index);
-                           
-                           if (buffer_index >= packet_length) {
-                               Serial.print("  [COMPLETE] ");
-                               for (int i = 0; i < packet_length; i++) {
-                                   if (receive_buffer[i] < 0x10) Serial.print("0");
-                                   Serial.print(receive_buffer[i], 16);
-                                   Serial.print(" ");
-                               }
-                               Serial.println();
-                               
-                               // Check for angle response
-                               if (packet_length >= 15 && 
-                                   receive_buffer[12] == 0x0E &&  // CmdSet
-                                   receive_buffer[13] == 0x02) {   // CmdID
-                                   Serial.println("  [ANGLE RESPONSE DETECTED]");
-                                   if (packet_length >= 22) {
-                                       uint8_t return_code = receive_buffer[14];
-                                       uint8_t data_type = receive_buffer[15];
-                                       int16_t yaw = (int16_t)(receive_buffer[16] | (receive_buffer[17] << 8));
-                                       int16_t roll = (int16_t)(receive_buffer[18] | (receive_buffer[19] << 8));
-                                       int16_t pitch = (int16_t)(receive_buffer[20] | (receive_buffer[21] << 8));
-                                       
-                                       Serial.print("    Return Code: 0x");
-                                       Serial.println(return_code, 16);
-                                       Serial.print("    Data Type: ");
-                                       Serial.println(data_type == 1 ? "Attitude" : (data_type == 2 ? "Joint" : "Unknown"));
-                                       Serial.print("    Angles: Yaw=");
-                                       Serial.print(yaw * 0.1, 1);
-                                       Serial.print("° Roll=");
-                                       Serial.print(roll * 0.1, 1);
-                                       Serial.print("° Pitch=");
-                                       Serial.print(pitch * 0.1, 1);
-                                       Serial.println("°");
-                                   }
-                               }
-                               
-                               buffer_index = 0;
-                           }
-                       } else if (buffer_index > 0 && receive_buffer[0] != 0xAA) {
-                           Serial.print("  [RESET] Invalid start:0x");
-                           Serial.println(receive_buffer[0], 16);
-                           buffer_index = 0;
-                       } });
-}
+// =============================================================================
+// CAN MESSAGE HANDLING
+// =============================================================================
 
 void sendPacketOverCAN(uint8_t *packet, uint8_t length)
 {
-    // Print outgoing packet
+    // Print outgoing packet for debugging
     Serial.print("[");
     Serial.print(millis());
     Serial.print("ms] CAN TX ID:0x");
@@ -244,6 +140,7 @@ void sendPacketOverCAN(uint8_t *packet, uint8_t length)
     }
     Serial.println();
 
+    // Split packet into CAN frames (max 8 bytes per frame)
     int frames = (length + 7) / 8;
 
     for (int frame = 0; frame < frames; frame++)
@@ -262,7 +159,7 @@ void sendPacketOverCAN(uint8_t *packet, uint8_t length)
             msg.buf[i] = packet[startByte + i];
         }
 
-        // Print each CAN frame
+        // Print each CAN frame for debugging
         Serial.print("  Frame ");
         Serial.print(frame + 1);
         Serial.print("/");
@@ -277,107 +174,254 @@ void sendPacketOverCAN(uint8_t *packet, uint8_t length)
         }
         Serial.println();
 
-        can0.write(msg);
-        delayMicroseconds(500);
+        can1.write(msg);
+        delayMicroseconds(500); // Small delay between frames
     }
 }
 
-void sendDJIPositionCommand()
+void onCANReceive(const CAN_message_t &msg)
 {
-    Serial.println("→ Sending position command...");
-    uint8_t packet[26];
-    uint16_t packet_index = 0;
+    // Increment message counter
+    total_rx_messages++;
 
-    packet[packet_index++] = 0xAA;
-    packet[packet_index++] = 0x1A;
-    packet[packet_index++] = 0x00;
-    packet[packet_index++] = 0x03;
-    packet[packet_index++] = 0x00;
-    packet[packet_index++] = 0x00;
-    packet[packet_index++] = 0x00;
-    packet[packet_index++] = 0x00;
-    packet[packet_index++] = 0x22;
-    packet[packet_index++] = 0x11;
+    // Print ALL received CAN messages with timestamp
+    Serial.print("[RX#");
+    Serial.print(total_rx_messages);
+    Serial.print(" @ ");
+    Serial.print(millis());
+    Serial.print("ms] ID:0x");
+    if (msg.id < 0x100)
+        Serial.print("0");
+    if (msg.id < 0x10)
+        Serial.print("0");
+    Serial.print(msg.id, 16);
+    Serial.print(" Len:");
+    Serial.print(msg.len);
+    Serial.print(" Data:");
+    for (int i = 0; i < msg.len; i++)
+    {
+        Serial.print(" ");
+        if (msg.buf[i] < 0x10)
+            Serial.print("0");
+        Serial.print(msg.buf[i], 16);
+    }
 
-    uint16_t crc16 = calculateCRC16_DJI(packet, 10);
-    packet[packet_index++] = crc16 & 0xFF;
-    packet[packet_index++] = (crc16 >> 8) & 0xFF;
+    // Check if this looks like a DJI packet
+    if (msg.id == DJI_CAN_RX_ID)
+    {
+        Serial.print(" *** DJI GIMBAL RESPONSE ***");
+    }
+    else
+    {
+        Serial.print(" (Unknown device)");
+    }
+    Serial.println();
 
-    packet[packet_index++] = 0x0E;
-    packet[packet_index++] = 0x00;
-    packet[packet_index++] = target_yaw & 0xFF;
-    packet[packet_index++] = (target_yaw >> 8) & 0xFF;
-    packet[packet_index++] = target_roll & 0xFF;
-    packet[packet_index++] = (target_roll >> 8) & 0xFF;
-    packet[packet_index++] = target_pitch & 0xFF;
-    packet[packet_index++] = (target_pitch >> 8) & 0xFF;
-    packet[packet_index++] = control_mode;
-    packet[packet_index++] = action_time;
+    // Packet reconstruction logic
+    static uint8_t receive_buffer[64];
+    static uint8_t buffer_index = 0;
 
-    uint32_t crc32 = calculateCRC32_DJI(packet, 22);
-    packet[packet_index++] = crc32 & 0xFF;
-    packet[packet_index++] = (crc32 >> 8) & 0xFF;
-    packet[packet_index++] = (crc32 >> 16) & 0xFF;
-    packet[packet_index++] = (crc32 >> 24) & 0xFF;
+    // Add received bytes to buffer
+    for (int i = 0; i < msg.len; i++)
+    {
+        if (buffer_index < 64)
+        {
+            receive_buffer[buffer_index++] = msg.buf[i];
+        }
+    }
 
-    sendPacketOverCAN(packet, 26);
+    // Check if we have a packet starting with 0xAA
+    if (buffer_index >= 3 && receive_buffer[0] == 0xAA)
+    {
+        uint16_t packet_length = receive_buffer[1] | (receive_buffer[2] << 8);
+
+        Serial.print("  [PACKET] Expected len:");
+        Serial.print(packet_length);
+        Serial.print(", Buffer has:");
+        Serial.println(buffer_index);
+
+        if (buffer_index >= packet_length)
+        {
+            Serial.print("  [COMPLETE] ");
+            for (int i = 0; i < packet_length; i++)
+            {
+                if (receive_buffer[i] < 0x10)
+                    Serial.print("0");
+                Serial.print(receive_buffer[i], 16);
+                Serial.print(" ");
+            }
+            Serial.println();
+
+            // Parse angle response using gimbal_position_readout module
+            parseAngleResponse(receive_buffer, packet_length);
+
+            // Reset buffer for next packet
+            buffer_index = 0;
+        }
+    }
+    else if (buffer_index > 0 && receive_buffer[0] != 0xAA)
+    {
+        Serial.print("  [RESET] Invalid start:0x");
+        Serial.println(receive_buffer[0], 16);
+        buffer_index = 0;
+    }
 }
 
-void sendDJIAngleInfoRequest(uint8_t angle_type = 0x01)
+// =============================================================================
+// SETUP AND MAIN LOOP
+// =============================================================================
+
+void setup()
 {
-    Serial.println("→ Sending angle info request...");
-    uint8_t packet[19];
-    uint16_t packet_index = 0;
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("DJI Gimbal CAN Monitor - RX Configuration Testing");
+    Serial.println("=== Modules ===");
+    Serial.println("- main.cpp: CRC + CAN handling");
+    Serial.println("- gimbal_position_set.cpp: Position control (CmdID 0x00)");
+    Serial.println("- gimbal_position_readout.cpp: Angle readout (CmdID 0x02)");
+    Serial.println("- gimbal_test_command.cpp: Documentation test command");
+    Serial.println("===============");
+    Serial.print("*** CAN RX CONFIG OPTION: ");
+    Serial.print(CAN_CONFIG_OPTION);
+    Serial.println(" ***");
+    Serial.println("*** TEST MODE: Sending doc example every 3s ***");
+    Serial.println("Expected: TX on 0x223, RX on 0x222");
+    Serial.println("============================================");
 
-    // Frame header
-    packet[packet_index++] = 0xAA; // SOF
-    packet[packet_index++] = 0x13; // Length LSB (19 bytes total)
-    packet[packet_index++] = 0x00; // Length MSB
-    packet[packet_index++] = 0x03; // CmdType (reply required)
-    packet[packet_index++] = 0x00; // ENC
-    packet[packet_index++] = 0x00; // RES[0]
-    packet[packet_index++] = 0x00; // RES[1]
-    packet[packet_index++] = 0x00; // RES[2]
-    packet[packet_index++] = 0x22; // SEQ LSB
-    packet[packet_index++] = 0x11; // SEQ MSB
+    // Initialize CAN interface
+    Serial.println("Initializing CAN interface...");
+    can1.begin();
+    can1.setBaudRate(DJI_BAUD_RATE);
 
-    // Calculate CRC16 for header (first 10 bytes)
-    uint16_t crc16 = calculateCRC16_DJI(packet, 10);
-    packet[packet_index++] = crc16 & 0xFF;        // CRC16 LSB
-    packet[packet_index++] = (crc16 >> 8) & 0xFF; // CRC16 MSB
+#if CAN_CONFIG_OPTION == 1
+    // Configuration Option 1: Mailboxes only
+    Serial.println("Config 1: Using Mailboxes (MB0=0x222, MB1=ANY)");
+    can1.setMaxMB(16);
 
-    // Data segment
-    packet[packet_index++] = 0x0E;       // CmdSet
-    packet[packet_index++] = 0x02;       // CmdID (Obtain angle information)
-    packet[packet_index++] = angle_type; // ctrl_byte: 0x01=attitude, 0x02=joint
+    // Set up mailbox 0 for receiving on ID 0x222
+    can1.setMB(MB0, RX, STD);
+    can1.setMBFilter(MB0, DJI_CAN_RX_ID);
 
-    // Calculate CRC32 for entire frame (excluding CRC32 itself)
-    uint32_t crc32 = calculateCRC32_DJI(packet, 15);
-    packet[packet_index++] = crc32 & 0xFF;         // CRC32 byte 0
-    packet[packet_index++] = (crc32 >> 8) & 0xFF;  // CRC32 byte 1
-    packet[packet_index++] = (crc32 >> 16) & 0xFF; // CRC32 byte 2
-    packet[packet_index++] = (crc32 >> 24) & 0xFF; // CRC32 byte 3
+    // Set up mailbox 1 for receiving ANY ID (debug)
+    can1.setMB(MB1, RX, STD);
+    // Accept all IDs by using the public setMBFilter overload with a zero mask
+    can1.setMBFilter(MB1, 0x000, 0x000); // No mask = accept all
 
-    sendPacketOverCAN(packet, 19);
+    Serial.print("✓ MB0 configured for ID 0x");
+    Serial.println(DJI_CAN_RX_ID, 16);
+    Serial.println("✓ MB1 configured for ANY ID");
+
+#elif CAN_CONFIG_OPTION == 2
+    // Configuration Option 2: FIFO only
+    Serial.println("Config 2: Using FIFO with ACCEPT_ALL");
+    can1.setMaxMB(16);
+    can1.enableFIFO();
+    can1.enableFIFOInterrupt();
+    can1.setFIFOFilter(ACCEPT_ALL);
+    Serial.println("✓ FIFO enabled with ACCEPT_ALL filter");
+
+#elif CAN_CONFIG_OPTION == 3
+    // Configuration Option 3: FIFO with specific filters
+    Serial.println("Config 3: Using FIFO with specific filters");
+    can1.setMaxMB(16);
+    can1.enableFIFO();
+    can1.enableFIFOInterrupt();
+    can1.setFIFOFilter(REJECT_ALL);
+    can1.setFIFOFilter(0, DJI_CAN_RX_ID, STD);
+    can1.setFIFOFilter(1, 0x000, STD); // Accept any ID in slot 1
+    Serial.print("✓ FIFO filter 0 set for ID 0x");
+    Serial.println(DJI_CAN_RX_ID, 16);
+    Serial.println("✓ FIFO filter 1 set for ANY ID");
+#endif
+
+    // Set up CAN receive callback
+    can1.onReceive(onCANReceive);
+
+    Serial.println("Setup complete. Starting communication...");
+    Serial.println("If you confirmed replies with CAN USB adapter but see");
+    Serial.println("NO RX messages here, the issue is Teensy CAN RX config.");
+    Serial.println("Try changing CAN_CONFIG_OPTION at top of main.cpp");
+    Serial.println("============================================");
 }
 
 void loop()
 {
-    can0.events();
+    can1.events();
 
+    // Send test command every 3 seconds (highest priority)
+    /*   if (enable_test_command && millis() - lastTestCommand >= TEST_COMMAND_INTERVAL)
+       {
+           lastTestCommand = millis();
+           sendDJITestCommand(); // From gimbal_test_command module
+       }
+   */
     // Send position commands every 5 seconds
     if (millis() - lastSend >= SEND_INTERVAL)
     {
         lastSend = millis();
-        sendDJIPositionCommand();
+        sendDJIPositionCommand(); // From gimbal_position_set module
     }
 
     // Send angle information requests every 1 second (if enabled)
     if (enable_angle_requests && millis() - lastAngleRequest >= ANGLE_REQUEST_INTERVAL)
     {
         lastAngleRequest = millis();
-        sendDJIAngleInfoRequest(0x01);
+        sendDJIAngleInfoRequest(0x01); // From gimbal_position_readout module
+    }
+
+    // Periodic CAN traffic monitoring
+    if (millis() - last_rx_count_check >= RX_CHECK_INTERVAL)
+    {
+        last_rx_count_check = millis();
+        Serial.println("\n=== CAN BUS STATUS ===");
+        Serial.print("Total RX messages in last 10s: ");
+        Serial.println(total_rx_messages);
+        Serial.print("Config option: ");
+        Serial.println(CAN_CONFIG_OPTION);
+
+        if (total_rx_messages == 0)
+        {
+            Serial.println("⚠️  WARNING: NO CAN RX detected!");
+            Serial.println("Since you confirmed gimbal replies with USB adapter:");
+            Serial.println("• Issue is Teensy CAN RX configuration");
+            Serial.println("• Try different CAN_CONFIG_OPTION (1, 2, or 3)");
+            Serial.println("• Check Teensy CAN pins: CAN1_RX=23, CAN1_TX=22");
+            Serial.println("• Verify 120Ω termination resistors");
+        }
+        else
+        {
+            Serial.println("✓ CAN RX working - check messages above");
+        }
+        Serial.println("========================\n");
+
+        // Reset counter for next period
+        total_rx_messages = 0;
     }
 
     delay(10);
+}
+
+// =============================================================================
+// UTILITY FUNCTIONS (FOR TESTING)
+// =============================================================================
+
+void testGimbalPosition()
+{
+    setGimbalPosition(0, 0, 0, 0x01, 30); // Center position, 3 seconds
+}
+
+void testPrintStatus()
+{
+    printGimbalStatus(); // From gimbal_position_readout module
+
+    float yaw, roll, pitch;
+    if (getCurrentGimbalAngles(&yaw, &roll, &pitch))
+    {
+        Serial.println("Current angles are valid and recent");
+    }
+    else
+    {
+        Serial.println("No recent angle data available");
+    }
 }
